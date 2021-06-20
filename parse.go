@@ -1,7 +1,6 @@
 package toml
 
 import (
-	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -14,40 +13,35 @@ type parser struct {
 	types   map[string]tomlType
 	lx      *lexer
 
-	// A list of keys in the order that they appear in the TOML data.
+	// List of keys in the order that they appear in the TOML data.
 	ordered []Key
 
-	// the full key for the current hash in scope
+	// Full key for the current hash in scope.
 	context Key
 
-	// the base key name for everything except hashes
+	// Base key name for everything except hashes.
 	currentKey string
 
-	// rough approximation of line number
+	// Rough approximation of line number
 	approxLine int
 
-	// A map of 'key.group.names' to whether they were created implicitly.
+	// Rough approximation of position (byte offset from start).
+	pos int
+
+	// Map of 'key.group.names' to whether they were created implicitly.
 	implicits map[string]bool
 }
 
-// ParseError is used when a file can't be parsed: for example invalid integer
-// literals, duplicate keys, etc.
-type ParseError struct {
-	Message string
-	Line    int
-	LastKey string
-}
-
-func (pe ParseError) Error() string {
-	return fmt.Sprintf("Near line %d (last key parsed '%s'): %s",
-		pe.Line, pe.LastKey, pe.Message)
-}
+var extendedError = true
 
 func parse(data string) (p *parser, err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			var ok bool
-			if err, ok = r.(ParseError); ok {
+			if dErr, ok := r.(DecodeError); ok {
+				if extendedError {
+					dErr.Input = data
+				}
+				err = dErr
 				return
 			}
 			panic(r)
@@ -67,8 +61,12 @@ func parse(data string) (p *parser, err error) {
 	if len(data) < 6 {
 		ex = len(data)
 	}
-	if strings.ContainsRune(data[:ex], 0) {
-		return nil, errors.New("files cannot contain NULL bytes; probably using UTF-16; TOML files must be UTF-8")
+	if i := strings.IndexRune(data[:ex], 0); i > -1 {
+		return nil, DecodeError{
+			Message: "files cannot contain NULL bytes; probably using UTF-16; TOML files must be UTF-8",
+			Pos:     i,
+			Line:    1,
+		}
 	}
 
 	p = &parser{
@@ -90,10 +88,10 @@ func parse(data string) (p *parser, err error) {
 }
 
 func (p *parser) panicf(format string, v ...interface{}) {
-	msg := fmt.Sprintf(format, v...)
-	panic(ParseError{
-		Message: msg,
+	panic(DecodeError{
+		Message: fmt.Sprintf(format, v...),
 		Line:    p.approxLine,
+		Pos:     p.pos,
 		LastKey: p.current(),
 	})
 }
@@ -102,6 +100,7 @@ func (p *parser) next() item {
 	it := p.lx.nextItem()
 	//fmt.Printf("ITEM %-18s line %-3d → %q\n", it.typ, it.line, it.val)
 	if it.typ == itemError {
+		p.pos = it.pos
 		p.panicf("%s", it.val)
 	}
 	return it
@@ -126,11 +125,11 @@ func (p *parser) assertEqual(expected, got itemType) {
 func (p *parser) topLevel(item item) {
 	switch item.typ {
 	case itemCommentStart:
-		p.approxLine = item.line
+		p.approxLine, p.pos = item.line, item.pos
 		p.expect(itemText)
 	case itemTableStart:
 		kg := p.next()
-		p.approxLine = kg.line
+		p.approxLine, p.pos = kg.line, item.pos
 
 		var key Key
 		for ; kg.typ != itemTableEnd && kg.typ != itemEOF; kg = p.next() {
@@ -143,7 +142,7 @@ func (p *parser) topLevel(item item) {
 		p.ordered = append(p.ordered, key)
 	case itemArrayTableStart:
 		kg := p.next()
-		p.approxLine = kg.line
+		p.approxLine, p.pos = kg.line, kg.pos
 
 		var key Key
 		for ; kg.typ != itemArrayTableEnd && kg.typ != itemEOF; kg = p.next() {
@@ -156,7 +155,7 @@ func (p *parser) topLevel(item item) {
 		p.ordered = append(p.ordered, key)
 	case itemKeyStart:
 		kname := p.next()
-		p.approxLine = kname.line
+		p.approxLine, p.pos = kname.line, kname.pos
 		p.currentKey = p.keyString(kname)
 
 		val, typ := p.value(p.next())
@@ -328,7 +327,7 @@ func (p *parser) value(it item) (interface{}, tomlType) {
 
 			// retrieve key
 			k := p.next()
-			p.approxLine = k.line
+			p.approxLine, p.pos = k.line, k.pos
 			kname := p.keyString(k)
 
 			// retrieve value
